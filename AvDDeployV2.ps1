@@ -37,7 +37,7 @@
 #   - Tailscale removed (call InstallTailscale.ps1 separately if a deployment
 #     needs it).
 #
-# Prerequisites
+# Prerequisites (storage-/identity-side, not session-host-side)
 #   1. Storage account is configured for AADKERB
 #      (`Set-AzStorageAccount -EnableAzureActiveDirectoryKerberosForFile $true`).
 #   2. Storage-account enterprise app has admin consent for openid /
@@ -48,9 +48,12 @@
 #      Data SMB Share Contributor" on the share. (For cloud-only identities
 #      the only supported share-level permission is the default share-level
 #      permission; configure it to that role.)
-#   5. Session host is Entra-joined with `CloudKerberosTicketRetrievalEnabled
-#      = 1` set via Intune Settings Catalog (NOT OMA-URI; OMA-URI doesn't
-#      apply on multi-session devices).
+#   5. Session host is Entra-joined.
+#      (CloudKerberosTicketRetrievalEnabled is set by this script — see
+#      "Cloud Kerberos Ticket Retrieval" section below. An equivalent Intune
+#      Settings Catalog policy is idempotent and can be added later for
+#      centralized management; if both are in place, both write the same
+#      registry value.)
 #
 # Migration path (target end state)
 #   - All values written here move into a single Intune Settings Catalog
@@ -125,6 +128,25 @@ New-ItemProperty -Path $profilesKey -Name "LockedRetryCount"                    
 New-ItemProperty -Path $profilesKey -Name "LockedRetryInterval"                  -Value 15     -PropertyType DWord  -Force | Out-Null
 New-ItemProperty -Path $profilesKey -Name "ReAttachIntervalSeconds"              -Value 15     -PropertyType DWord  -Force | Out-Null
 New-ItemProperty -Path $profilesKey -Name "ReAttachRetryCount"                   -Value 3      -PropertyType DWord  -Force | Out-Null
+
+# --- Cloud Kerberos Ticket Retrieval (Entra Kerberos client switch) ---------
+# This single REG_DWORD is what enables Win 11 / Server 2025 to request
+# Kerberos tickets from Entra ID for SMB authentication to Azure Files.
+# Without it, FSLogix can't mount the AADKERB-configured share even when
+# everything else is in place — the user's Kerberos ticket simply isn't
+# requested.
+#
+# Microsoft documents an Intune Settings Catalog policy as the "supported
+# way" to set this on multi-session AVD; the underlying mechanism is
+# identical to the registry write below. Setting it here means the session
+# host is fully self-configuring on first boot — no Intune profile sync
+# timing dependency. If an Intune profile is later added for centralized
+# management, both layers write the same value (idempotent).
+#
+# See Microsoft Learn (note the registry-key tab):
+# https://learn.microsoft.com/en-us/azure/storage/files/storage-files-identity-auth-hybrid-identities-enable
+New-Item        -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters" -Force -ErrorAction Ignore | Out-Null
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters" -Name "CloudKerberosTicketRetrievalEnabled" -Value 1 -PropertyType DWord -Force | Out-Null
 
 # --- Credential Guard / LSA tweak -------------------------------------------
 # TODO: move into AIB image build (env-agnostic). Setting LsaCfgFlags=0
