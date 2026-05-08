@@ -167,28 +167,37 @@ if ($hostPoolRegistrationToken) {
     $agentMsi      = Join-Path $env:TEMP 'RDInfraAgent.msi'
     $bootloaderMsi = Join-Path $env:TEMP 'RDInfraAgentBootloader.msi'
 
-    Write-Host '  downloading agent + bootloader MSIs (Microsoft FWLinks)'
-    Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2310011' -OutFile $agentMsi      -UseBasicParsing
+    Write-Host '  downloading bootloader + agent MSIs (Microsoft FWLinks)'
     Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2311028' -OutFile $bootloaderMsi -UseBasicParsing
+    Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2310011' -OutFile $agentMsi      -UseBasicParsing
+
+    # Install order matters — BootLoader must be installed before the Agent.
+    # avdaccelerator's Set-SessionHostConfiguration.ps1 follows this order
+    # because the Agent install is what actually triggers the broker
+    # registration; doing it first leaves a window where the Agent service
+    # has no BootLoader to start it on next boot. The 5s gap between
+    # installers is also from avdaccelerator (gives MSI's rollback / log
+    # writer time to release file handles before the next msiexec runs).
+    Write-Host '  installing RDAgentBootLoader (no token; runs first)'
+    $blInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+        '/i', "`"$bootloaderMsi`"", '/quiet', '/qn', '/norestart', '/passive'
+    )
+    if ($blInstall.ExitCode -ne 0) {
+        Write-Error "RDAgentBootLoader install failed: msiexec exit $($blInstall.ExitCode)"
+        Exit 2
+    }
+    Start-Sleep -Seconds 5
 
     Write-Host '  installing RDInfraAgent (REGISTRATIONTOKEN passed as MSI property)'
     $agentInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-        '/i', "`"$agentMsi`"", '/quiet', '/qn', '/norestart',
+        '/i', "`"$agentMsi`"", '/quiet', '/qn', '/norestart', '/passive',
         "REGISTRATIONTOKEN=$hostPoolRegistrationToken"
     )
     if ($agentInstall.ExitCode -ne 0) {
         Write-Error "RDInfraAgent install failed: msiexec exit $($agentInstall.ExitCode)"
         Exit 2
     }
-
-    Write-Host '  installing RDAgentBootLoader (starts the agent service)'
-    $blInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
-        '/i', "`"$bootloaderMsi`"", '/quiet', '/qn', '/norestart'
-    )
-    if ($blInstall.ExitCode -ne 0) {
-        Write-Error "RDAgentBootLoader install failed: msiexec exit $($blInstall.ExitCode)"
-        Exit 2
-    }
+    Start-Sleep -Seconds 5
 
     # Poll for registration. The agent reads the token, contacts the AVD
     # broker, and flips IsRegistered to 1. Normal time is 30-90 seconds;
