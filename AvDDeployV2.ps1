@@ -142,43 +142,69 @@ Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyConti
 # spawn msiexec from its non-interactive SYSTEM session on this image even
 # though the same MSI installs cleanly when invoked directly.
 #
-# The 25H2 multisession marketplace image ships these MSIs pre-installed:
-#   - Microsoft.RDInfra.RDAgentBootLoader
-#   - Microsoft.RDInfra.RDAgent (auto-updates after first registration)
-# So registration just needs the token planted in the registry and the
-# bootloader service bounced — no MSI install. If for some reason the
-# bootloader isn't present (custom image, future SKU change), the MSIs are
-# downloaded from the public AVD gallery blob.
+# Two MSIs are installed:
+#   - Microsoft.RDInfra.RDAgent.Installer-x64        (the agent; takes the
+#                                                     REGISTRATIONTOKEN MSI
+#                                                     property and plants
+#                                                     it in HKLM:\SOFTWARE\
+#                                                     Microsoft\RDInfraAgent)
+#   - Microsoft.RDInfra.RDAgentBootLoader.Installer  (the bootloader service
+#                                                     that starts the agent)
 #
-# Run before FSLogix config so a broken broker handshake fails fast.
+# Microsoft FWLinks always resolve to the latest GA versions of both MSIs:
+#   2310011 -> Microsoft.RDInfra.RDAgent.Installer-x64-<latest>.msi
+#   2311028 -> Microsoft.RDInfra.RDAgentBootLoader.Installer-x64.msi
+# These are documented at
+# https://learn.microsoft.com/en-us/azure/virtual-desktop/agent-overview
+# (Azure/avdaccelerator's Set-SessionHostConfiguration uses the same FWLinks).
+#
+# Idempotent: re-running the MSIs upgrades in place; the REGISTRATIONTOKEN
+# property re-plants the token each time. Run before FSLogix config so a
+# broken broker handshake fails fast.
 if ($hostPoolRegistrationToken) {
     Write-Host '--- (2/3) registering session host with AVD host pool'
 
-    $bootloaderService = Get-Service -Name 'RDAgentBootLoader' -ErrorAction SilentlyContinue
-    if (-not $bootloaderService) {
-        Write-Host '  RDAgentBootLoader service not present — installing AVD agent MSIs'
-        $msiBase = 'https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts'
-        $agentMsi      = Join-Path $env:TEMP 'RDInfraAgent.msi'
-        $bootloaderMsi = Join-Path $env:TEMP 'RDInfraAgentBootloader.msi'
-        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgent.Installer-x64.msi" -OutFile $agentMsi -UseBasicParsing
-        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgentBootLoader.Installer-x64.msi" -OutFile $bootloaderMsi -UseBasicParsing
-        Start-Process msiexec.exe -ArgumentList @('/i', $agentMsi, '/qn', '/norestart', "REGISTRATIONTOKEN=$hostPoolRegistrationToken") -Wait
-        Start-Process msiexec.exe -ArgumentList @('/i', $bootloaderMsi, '/qn', '/norestart') -Wait
-    } else {
-        Write-Host '  RDAgentBootLoader pre-installed — planting token via registry'
-        Stop-Service -Name 'RDAgentBootLoader' -Force -ErrorAction SilentlyContinue
-        Stop-Service -Name 'RDAgent'           -Force -ErrorAction SilentlyContinue
-        $agentKey = 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent'
-        New-Item -Path $agentKey -Force -ErrorAction Ignore | Out-Null
-        Set-ItemProperty -Path $agentKey -Name 'RegistrationToken' -Value $hostPoolRegistrationToken -Type String
-        Set-ItemProperty -Path $agentKey -Name 'IsRegistered'      -Value 0 -Type DWord
-        Start-Service -Name 'RDAgentBootLoader'
+    $agentMsi      = Join-Path $env:TEMP 'RDInfraAgent.msi'
+    $bootloaderMsi = Join-Path $env:TEMP 'RDInfraAgentBootloader.msi'
+
+    Write-Host '  downloading bootloader + agent MSIs (Microsoft FWLinks)'
+    Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2311028' -OutFile $bootloaderMsi -UseBasicParsing
+    Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/?linkid=2310011' -OutFile $agentMsi      -UseBasicParsing
+
+    # Install order matters — BootLoader must be installed before the Agent.
+    # avdaccelerator's Set-SessionHostConfiguration.ps1 follows this order
+    # because the Agent install is what actually triggers the broker
+    # registration; doing it first leaves a window where the Agent service
+    # has no BootLoader to start it on next boot. The 5s gap between
+    # installers is also from avdaccelerator (gives MSI's rollback / log
+    # writer time to release file handles before the next msiexec runs).
+    Write-Host '  installing RDAgentBootLoader (no token; runs first)'
+    $blInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+        '/i', "`"$bootloaderMsi`"", '/quiet', '/qn', '/norestart', '/passive'
+    )
+    if ($blInstall.ExitCode -ne 0) {
+        Write-Error "RDAgentBootLoader install failed: msiexec exit $($blInstall.ExitCode)"
+        Exit 2
     }
+    Start-Sleep -Seconds 5
+
+    Write-Host '  installing RDInfraAgent (REGISTRATIONTOKEN passed as MSI property)'
+    $agentInstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+        '/i', "`"$agentMsi`"", '/quiet', '/qn', '/norestart', '/passive',
+        "REGISTRATIONTOKEN=$hostPoolRegistrationToken"
+    )
+    if ($agentInstall.ExitCode -ne 0) {
+        Write-Error "RDInfraAgent install failed: msiexec exit $($agentInstall.ExitCode)"
+        Exit 2
+    }
+    Start-Sleep -Seconds 5
 
     # Poll for registration. The agent reads the token, contacts the AVD
     # broker, and flips IsRegistered to 1. Normal time is 30-90 seconds;
     # cap at 10 minutes so a broken broker doesn't hang the deploy.
+    Write-Host '  polling HKLM:\SOFTWARE\Microsoft\RDInfraAgent\IsRegistered (10 min)'
     $deadline = (Get-Date).AddMinutes(10)
+    $isRegistered = 0
     while ((Get-Date) -lt $deadline) {
         $isRegistered = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent' -Name 'IsRegistered' -ErrorAction SilentlyContinue).IsRegistered
         if ($isRegistered -eq 1) {
