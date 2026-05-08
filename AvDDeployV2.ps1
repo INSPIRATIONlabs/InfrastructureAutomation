@@ -72,11 +72,22 @@
 #                  \\<storage-account>.privatelink.file.core.windows.net\<share-name>
 #   -sharename     share name only, e.g. share-profiles
 #                  (used for the Defender path exclusion)
+#   -hostPoolRegistrationToken
+#                  AVD host-pool registration token. When supplied, this script
+#                  also registers the session host with the host pool — replacing
+#                  the brittle Microsoft.PowerShell.DSC extension that fails on
+#                  the Win 11 25H2 marketplace image with "Access is denied" at
+#                  RunMsiWithRetry. The marketplace 25H2 multisession image
+#                  ships RDAgentBootLoader pre-installed; this script plants the
+#                  token in the registry and bounces the bootloader, the same
+#                  pattern as Azure/avdaccelerator's Set-SessionHostConfiguration.
+#                  When omitted, registration is skipped (legacy/AIB-image path).
 
 param(
     [Parameter(Mandatory = $true)] [string] $fileServer,
     [Parameter(Mandatory = $true)] [string] $profileShare,
-    [Parameter(Mandatory = $true)] [string] $sharename
+    [Parameter(Mandatory = $true)] [string] $sharename,
+    [Parameter(Mandatory = $false)][string] $hostPoolRegistrationToken = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,16 +105,101 @@ if (-not (Test-Path $frxPath)) {
     Exit 1
 }
 
-Write-Host "=== AvDDeployV2: configuring FSLogix Profile Container (VHDLocations, Entra Kerberos) ==="
+Write-Host "=== AvDDeployV2: starting ==="
 Write-Host "  share: $profileShare"
 Write-Host "  frx:   $((Get-Item $frxPath).VersionInfo.FileVersion)"
 
-# --- FSLogix Profile Container ----------------------------------------------
+# Order of operations:
+#   1. Network category + RDP firewall — gets Bastion reachable immediately,
+#      so if a later step fails the host is still debuggable mid-CSE.
+#   2. AVD agent registration — long-running, network-dependent, the most
+#      likely step to fail. Fail fast; don't waste time on registry writes
+#      that won't matter if the broker handshake is broken.
+#   3. FSLogix + Cloud Kerberos + Defender exclusions — deterministic
+#      registry writes, no external dependencies.
+#   4. Reboot.
+# This matches avdaccelerator's Set-SessionHostConfiguration.ps1 sequence.
+
+# --- 1. Network category: Public -> Private + RDP firewall ------------------
+# Win 11 25H2 marketplace images categorize the Azure NIC as "Public", which
+# silently suppresses inbound firewall Allow rules for cross-subnet traffic
+# (including Bastion -> 3389) even when those rules are Enabled with
+# Profile=Any. Setting the profile to Private at provisioning time makes the
+# Allow rules effective. See win11_25h2_network_category memory note.
+Write-Host '--- (1/3) network category + RDP firewall'
+Get-NetConnectionProfile |
+    Where-Object { $_.IPv4Connectivity -ne 'NoTraffic' } |
+    Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+
+# Make sure the built-in RDP rules are enabled. The 25H2 marketplace image
+# ships them disabled by default; AIB images had them on.
+Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+# --- 2. AVD agent registration ----------------------------------------------
+# Replaces the Microsoft.PowerShell.DSC extension. The DSC `AddSessionHost`
+# configuration's RunMsiWithRetry / InstallRDAgents step fails on the Win 11
+# 25H2 marketplace image with "Access is denied" — the DSC handler can't
+# spawn msiexec from its non-interactive SYSTEM session on this image even
+# though the same MSI installs cleanly when invoked directly.
+#
+# The 25H2 multisession marketplace image ships these MSIs pre-installed:
+#   - Microsoft.RDInfra.RDAgentBootLoader
+#   - Microsoft.RDInfra.RDAgent (auto-updates after first registration)
+# So registration just needs the token planted in the registry and the
+# bootloader service bounced — no MSI install. If for some reason the
+# bootloader isn't present (custom image, future SKU change), the MSIs are
+# downloaded from the public AVD gallery blob.
+#
+# Run before FSLogix config so a broken broker handshake fails fast.
+if ($hostPoolRegistrationToken) {
+    Write-Host '--- (2/3) registering session host with AVD host pool'
+
+    $bootloaderService = Get-Service -Name 'RDAgentBootLoader' -ErrorAction SilentlyContinue
+    if (-not $bootloaderService) {
+        Write-Host '  RDAgentBootLoader service not present — installing AVD agent MSIs'
+        $msiBase = 'https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts'
+        $agentMsi      = Join-Path $env:TEMP 'RDInfraAgent.msi'
+        $bootloaderMsi = Join-Path $env:TEMP 'RDInfraAgentBootloader.msi'
+        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgent.Installer-x64.msi" -OutFile $agentMsi -UseBasicParsing
+        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgentBootLoader.Installer-x64.msi" -OutFile $bootloaderMsi -UseBasicParsing
+        Start-Process msiexec.exe -ArgumentList @('/i', $agentMsi, '/qn', '/norestart', "REGISTRATIONTOKEN=$hostPoolRegistrationToken") -Wait
+        Start-Process msiexec.exe -ArgumentList @('/i', $bootloaderMsi, '/qn', '/norestart') -Wait
+    } else {
+        Write-Host '  RDAgentBootLoader pre-installed — planting token via registry'
+        Stop-Service -Name 'RDAgentBootLoader' -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name 'RDAgent'           -Force -ErrorAction SilentlyContinue
+        $agentKey = 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent'
+        New-Item -Path $agentKey -Force -ErrorAction Ignore | Out-Null
+        Set-ItemProperty -Path $agentKey -Name 'RegistrationToken' -Value $hostPoolRegistrationToken -Type String
+        Set-ItemProperty -Path $agentKey -Name 'IsRegistered'      -Value 0 -Type DWord
+        Start-Service -Name 'RDAgentBootLoader'
+    }
+
+    # Poll for registration. The agent reads the token, contacts the AVD
+    # broker, and flips IsRegistered to 1. Normal time is 30-90 seconds;
+    # cap at 10 minutes so a broken broker doesn't hang the deploy.
+    $deadline = (Get-Date).AddMinutes(10)
+    while ((Get-Date) -lt $deadline) {
+        $isRegistered = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent' -Name 'IsRegistered' -ErrorAction SilentlyContinue).IsRegistered
+        if ($isRegistered -eq 1) {
+            Write-Host '  IsRegistered=1 — session host registered with host pool'
+            break
+        }
+        Start-Sleep -Seconds 10
+    }
+    if ($isRegistered -ne 1) {
+        Write-Error 'AVD agent failed to register within 10 minutes (IsRegistered != 1).'
+        Exit 2
+    }
+}
+
+# --- 3. FSLogix Profile Container -------------------------------------------
 # Single container per user. Captures profile + Outlook OST + Teams cache +
 # OneDrive cache + Office settings. No ODFC — see header.
 #
 # Target: move all of these into Intune Settings Catalog → "FSLogix > Profile
 # Containers" once the Intune profile is set up.
+Write-Host '--- (3/3) FSLogix + Cloud Kerberos + Defender exclusions'
 New-Item -Path "HKLM:\SOFTWARE"          -Name "FSLogix"  -ErrorAction Ignore | Out-Null
 New-Item -Path "HKLM:\SOFTWARE\FSLogix"  -Name "Profiles" -ErrorAction Ignore | Out-Null
 
