@@ -72,11 +72,22 @@
 #                  \\<storage-account>.privatelink.file.core.windows.net\<share-name>
 #   -sharename     share name only, e.g. share-profiles
 #                  (used for the Defender path exclusion)
+#   -hostPoolRegistrationToken
+#                  AVD host-pool registration token. When supplied, this script
+#                  also registers the session host with the host pool — replacing
+#                  the brittle Microsoft.PowerShell.DSC extension that fails on
+#                  the Win 11 25H2 marketplace image with "Access is denied" at
+#                  RunMsiWithRetry. The marketplace 25H2 multisession image
+#                  ships RDAgentBootLoader pre-installed; this script plants the
+#                  token in the registry and bounces the bootloader, the same
+#                  pattern as Azure/avdaccelerator's Set-SessionHostConfiguration.
+#                  When omitted, registration is skipped (legacy/AIB-image path).
 
 param(
     [Parameter(Mandatory = $true)] [string] $fileServer,
     [Parameter(Mandatory = $true)] [string] $profileShare,
-    [Parameter(Mandatory = $true)] [string] $sharename
+    [Parameter(Mandatory = $true)] [string] $sharename,
+    [Parameter(Mandatory = $false)][string] $hostPoolRegistrationToken = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,6 +108,20 @@ if (-not (Test-Path $frxPath)) {
 Write-Host "=== AvDDeployV2: configuring FSLogix Profile Container (VHDLocations, Entra Kerberos) ==="
 Write-Host "  share: $profileShare"
 Write-Host "  frx:   $((Get-Item $frxPath).VersionInfo.FileVersion)"
+
+# --- Network category: Public -> Private ------------------------------------
+# Win 11 25H2 marketplace images categorize the Azure NIC as "Public", which
+# silently suppresses inbound firewall Allow rules for cross-subnet traffic
+# (including Bastion -> 3389) even when those rules are Enabled with
+# Profile=Any. Setting the profile to Private at provisioning time makes the
+# Allow rules effective. See win11_25h2_network_category memory note.
+Get-NetConnectionProfile |
+    Where-Object { $_.IPv4Connectivity -ne 'NoTraffic' } |
+    Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+
+# Make sure the built-in RDP rules are enabled. The 25H2 marketplace image
+# ships them disabled by default; AIB images had them on.
+Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
 
 # --- FSLogix Profile Container ----------------------------------------------
 # Single container per user. Captures profile + Outlook OST + Teams cache +
@@ -181,6 +206,62 @@ foreach ($principal in @('azure', 'defaultuser100000')) {
 # the AIB image build, NOT here.
 Add-MpPreference -ExclusionPath "\\$fileServer\$sharename\*.VHD"  -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "\\$fileServer\$sharename\*.VHDX" -ErrorAction SilentlyContinue
+
+# --- AVD agent registration -------------------------------------------------
+# Replaces the Microsoft.PowerShell.DSC extension. The DSC `AddSessionHost`
+# configuration's RunMsiWithRetry / InstallRDAgents step fails on the Win 11
+# 25H2 marketplace image with "Access is denied" — the DSC handler can't
+# spawn msiexec from its non-interactive SYSTEM session on this image even
+# though the same MSI installs cleanly when invoked directly.
+#
+# The 25H2 multisession marketplace image ships these MSIs pre-installed:
+#   - Microsoft.RDInfra.RDAgentBootLoader
+#   - Microsoft.RDInfra.RDAgent (auto-updates after first registration)
+# So registration just needs the token planted in the registry and the
+# bootloader service bounced — no MSI install. If for some reason the
+# bootloader isn't present (custom image, future SKU change), the MSIs are
+# downloaded from the public AVD gallery blob.
+if ($hostPoolRegistrationToken) {
+    Write-Host '=== AvDDeployV2: registering session host with AVD host pool ==='
+
+    $bootloaderService = Get-Service -Name 'RDAgentBootLoader' -ErrorAction SilentlyContinue
+    if (-not $bootloaderService) {
+        Write-Host '  RDAgentBootLoader service not present — installing AVD agent MSIs'
+        $msiBase = 'https://wvdportalstorageblob.blob.core.windows.net/galleryartifacts'
+        $agentMsi      = Join-Path $env:TEMP 'RDInfraAgent.msi'
+        $bootloaderMsi = Join-Path $env:TEMP 'RDInfraAgentBootloader.msi'
+        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgent.Installer-x64.msi" -OutFile $agentMsi -UseBasicParsing
+        Invoke-WebRequest -Uri "$msiBase/Microsoft.RDInfra.RDAgentBootLoader.Installer-x64.msi" -OutFile $bootloaderMsi -UseBasicParsing
+        Start-Process msiexec.exe -ArgumentList @('/i', $agentMsi, '/qn', '/norestart', "REGISTRATIONTOKEN=$hostPoolRegistrationToken") -Wait
+        Start-Process msiexec.exe -ArgumentList @('/i', $bootloaderMsi, '/qn', '/norestart') -Wait
+    } else {
+        Write-Host '  RDAgentBootLoader pre-installed — planting token via registry'
+        Stop-Service -Name 'RDAgentBootLoader' -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name 'RDAgent'           -Force -ErrorAction SilentlyContinue
+        $agentKey = 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent'
+        New-Item -Path $agentKey -Force -ErrorAction Ignore | Out-Null
+        Set-ItemProperty -Path $agentKey -Name 'RegistrationToken' -Value $hostPoolRegistrationToken -Type String
+        Set-ItemProperty -Path $agentKey -Name 'IsRegistered'      -Value 0 -Type DWord
+        Start-Service -Name 'RDAgentBootLoader'
+    }
+
+    # Poll for registration. The agent reads the token, contacts the AVD
+    # broker, and flips IsRegistered to 1. Normal time is 30-90 seconds;
+    # cap at 10 minutes so a broken broker doesn't hang the deploy.
+    $deadline = (Get-Date).AddMinutes(10)
+    while ((Get-Date) -lt $deadline) {
+        $isRegistered = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\RDInfraAgent' -Name 'IsRegistered' -ErrorAction SilentlyContinue).IsRegistered
+        if ($isRegistered -eq 1) {
+            Write-Host '  IsRegistered=1 — session host registered with host pool'
+            break
+        }
+        Start-Sleep -Seconds 10
+    }
+    if ($isRegistered -ne 1) {
+        Write-Error 'AVD agent failed to register within 10 minutes (IsRegistered != 1).'
+        Exit 2
+    }
+}
 
 Write-Host "=== AvDDeployV2: done. Restarting to apply settings. ==="
 shutdown -r -t 0
