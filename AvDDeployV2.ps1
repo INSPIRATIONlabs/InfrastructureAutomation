@@ -217,6 +217,72 @@ if ($hostPoolRegistrationToken) {
         Write-Error 'AVD agent failed to register within 10 minutes (IsRegistered != 1).'
         Exit 2
     }
+
+    # --- 2b. SxS Network Stack install verification + retry -----------------
+    # RDInfraAgent.msi bundles SxSStack-<version>.msi as a payload and
+    # installs it transitively. That nested install sometimes returns
+    # status 1603 (FATAL) on Win 11 25H2 marketplace images even though
+    # the outer agent MSI returns 0 and IsRegistered flips to 1.
+    #
+    # When that happens the agent registers and heartbeats, but the SxS
+    # listener service never starts -- the session host shows "Available"
+    # briefly, then the bootloader's automatic version-management routine
+    # notices the broken SxS, uninstalls it cleanly, and tries to reinstall.
+    # The reinstall hits the same 1603 (same DLL-init race underneath the
+    # MSI custom action) -- and now SxS is just gone, host stays Unavailable.
+    #
+    # Manual retry of the same MSI ~30s later succeeds (system has settled),
+    # so wrap with up to 4 retries before failing the deploy. The script-side
+    # IsRegistered=1 check above isn't sufficient because it only reflects
+    # broker handshake, not listener health.
+    $sxsLog = Get-ChildItem 'C:\Program Files\Microsoft RDInfra\SXSStackInstall*.txt' -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $sxsMsi = Get-ChildItem 'C:\Program Files\Microsoft RDInfra\SxSStack-*.msi' -EA SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+    $sxsFailed = $false
+    if ($sxsLog) {
+        $logContent = Get-Content $sxsLog.FullName -Raw -EA SilentlyContinue
+        # English: "Installation success or error status: 1603"
+        # German : "Erfolg- bzw. Fehlerstatus der Installation: 1603"
+        if ($logContent -match 'status:\s*1603' -or
+            $logContent -match 'Fehlerstatus der Installation:\s*1603') {
+            $sxsFailed = $true
+        }
+    }
+
+    if ($sxsFailed -and $sxsMsi) {
+        Write-Host "  SxS install reported 1603 in $($sxsLog.Name) -- retrying"
+        $maxAttempts = 4
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Start-Sleep -Seconds 30  # give DLL-init race time to settle
+            $retryLog = Join-Path $env:TEMP "SxSRetry-$attempt.log"
+            $r = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+                '/i', "`"$($sxsMsi.FullName)`"",
+                '/qn', '/norestart',
+                '/l*v', "`"$retryLog`""
+            )
+            Write-Host "  SxS retry $attempt of ${maxAttempts}: msiexec exit=$($r.ExitCode)"
+            if ($r.ExitCode -in 0, 3010) {
+                Write-Host '  SxS reinstall succeeded'
+                # Restart bootloader so the new SxS becomes the active stack
+                # immediately rather than on next maintenance cycle.
+                Restart-Service RDAgentBootLoader -Force -EA SilentlyContinue
+                break
+            }
+            if ($attempt -eq $maxAttempts) {
+                Write-Error "SxS Network Stack install failed after $maxAttempts retries (last exit=$($r.ExitCode))"
+                Exit 2
+            }
+        }
+    }
+    elseif ($sxsFailed -and -not $sxsMsi) {
+        Write-Error 'SxS install reported 1603 but no SxSStack-*.msi found to retry'
+        Exit 2
+    }
+    else {
+        Write-Host '  SxS install OK (no 1603 in log)'
+    }
 }
 
 # --- 3. FSLogix Profile Container -------------------------------------------
